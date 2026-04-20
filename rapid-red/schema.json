@@ -1,0 +1,124 @@
+{
+  "_comment": "RapidRed Firebase Realtime Database Schema v1.0",
+  "_note": "Replace placeholder values with real coordinates before deployment.",
+
+  "hospitals": {
+    "H001": {
+      "name": "AIIMS Delhi",
+      "location": {
+        "lat": 28.5672,
+        "lng": 77.2100,
+        "address": "Sri Aurobindo Marg, Ansari Nagar, New Delhi"
+      },
+      "inventory": {
+        "O-":     5,
+        "O+":     12,
+        "AB-":    2,
+        "AB+":    8,
+        "A-":     3,
+        "A+":     15,
+        "B-":     1,
+        "B+":     10,
+        "Bombay": 1
+      },
+      "health_credits": 0,
+      "contact": "+91-11-26588500",
+      "verified": true
+    },
+    "H002": {
+      "name": "Safdarjung Hospital",
+      "location": {
+        "lat": 28.5685,
+        "lng": 77.2064,
+        "address": "Ansari Nagar West, New Delhi"
+      },
+      "inventory": {
+        "O-":     0,
+        "O+":     20,
+        "AB-":    0,
+        "AB+":    5,
+        "A-":     0,
+        "A+":     9,
+        "B-":     0,
+        "B+":     7,
+        "Bombay": 0
+      },
+      "health_credits": 120,
+      "contact": "+91-11-26165060",
+      "verified": true
+    }
+  },
+
+  "donors": {
+    "D001": {
+      "name": "Rahul Sharma",
+      "blood_group": "O-",
+      "health_credits": 350,
+      "donations": 7,
+      "last_donation_date": "2024-11-20",
+      "eligible_to_donate": true,
+      "location": {
+        "lat": 28.6139,
+        "lng": 77.2090
+      }
+    },
+    "D002": {
+      "name": "Priya Singh",
+      "blood_group": "AB-",
+      "health_credits": 500,
+      "donations": 5,
+      "last_donation_date": "2024-10-05",
+      "eligible_to_donate": true,
+      "location": {
+        "lat": 28.5355,
+        "lng": 77.2936
+      }
+    }
+  },
+
+  "blood_requests": {
+    "REQ_TEMPLATE": {
+      "request_id": "AUTO_GENERATED",
+      "blood_group": "O-",
+      "units_needed": 2,
+      "recipient_location": {
+        "lat": 28.5800,
+        "lng": 77.2150
+      },
+      "matched_hospital_id": "H001",
+      "status": "DISPATCHED",
+      "rider_id": "RIDER-101",
+      "created_at": "ISO_TIMESTAMP",
+      "eta_minutes": 8.3,
+      "golden_hour_alert": false
+    }
+  },
+
+  "active_riders": {
+    "RIDER-101": {
+      "name": "Arjun K.",
+      "phone": "+91-9876543210",
+      "current_location": {
+        "lat": 28.5700,
+        "lng": 77.2120
+      },
+      "status": "EN_ROUTE",
+      "assigned_request": "AUTO_REQUEST_ID",
+      "vehicle": "Motorcycle",
+      "rating": 4.9
+    }
+  },
+
+  "rarity_config": {
+    "_comment": "Adjust weights here to tune the matching algorithm",
+    "Bombay": { "weight": 10.0, "credits_per_unit": 500, "tier": "CRITICAL" },
+    "AB-":    { "weight": 5.0,  "credits_per_unit": 200, "tier": "CRITICAL" },
+    "O-":     { "weight": 4.0,  "credits_per_unit": 150, "tier": "CRITICAL" },
+    "B-":     { "weight": 3.5,  "credits_per_unit": 120, "tier": "HIGH" },
+    "A-":     { "weight": 3.0,  "credits_per_unit": 100, "tier": "HIGH" },
+    "AB+":    { "weight": 2.0,  "credits_per_unit": 60,  "tier": "STANDARD" },
+    "B+":     { "weight": 1.5,  "credits_per_unit": 50,  "tier": "STANDARD" },
+    "A+":     { "weight": 1.2,  "credits_per_unit": 40,  "tier": "STANDARD" },
+    "O+":     { "weight": 1.0,  "credits_per_unit": 30,  "tier": "STANDARD" }
+  }
+}
