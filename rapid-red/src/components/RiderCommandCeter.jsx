@@ -12,7 +12,7 @@
 import { useState, useEffect, useRef } from "react";
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-const API = "http://localhost:8000"; // adjust if deployed elsewhere
+const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
 
 // ─── MOCK DATA (mirrors backend RIDERS exactly, used when API is offline) ────
 const MOCK_RIDERS = [
