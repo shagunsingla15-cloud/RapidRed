@@ -245,6 +245,7 @@ function RateModal({ rider, onClose, onSubmit }) {
   const [comment, setComment]   = useState("");
   const [loading, setLoading]   = useState(false);
   const [result, setResult]     = useState(null);
+  const [err, setErr]           = useState("");
 
   const TAGS = ["Friendly Nature", "Handled with Care", "Hospital Staff Engagement"];
 
@@ -259,6 +260,11 @@ function RateModal({ rider, onClose, onSubmit }) {
         body: JSON.stringify({ rider_id: rider.rider_id, hospital_id: hospitalId, stars, feedback_tags: tags, comment }),
       });
       const data = await res.json();
+      if (!res.ok) {
+        setErr(typeof data.detail === "string" ? data.detail : "The rating was rejected.");
+        setLoading(false);
+        return;
+      }
       setResult(data);
       onSubmit(data);
     } catch {
@@ -343,7 +349,9 @@ function RateModal({ rider, onClose, onSubmit }) {
                 style={{ width:"100%", background:"#0d0d14", color:"#ddd", border:"1px solid #333",
                   borderRadius:8, padding:"8px 10px", fontSize:13, resize:"none", boxSizing:"border-box" }} />
             </div>
-
+            {err && (
+              <div role="alert" style={{ marginBottom:10, padding:"8px 12px", borderRadius:8, background:"rgba(192,57,43,.12)", border:"1px solid #c0392b66", color:"#e74c3c", fontSize:12 }}>{err}</div>
+            )}
             <button onClick={submit} disabled={loading}
               style={{ width:"100%", padding:"11px 0", borderRadius:8,
                 background: loading ? "#333" : "#c0392b", color:"#fff", fontWeight:800,
@@ -596,13 +604,17 @@ export default function RiderCommandCenter() {
   }, []);
 
   // Try to fetch live data
-  useEffect(() => {
-    fetch(`${API}/rider-hierarchy`)
+    useEffect(() => {
+    // refresh every 5 s so rider status (Available / Busy) and ratings stay in sync with dispatches
+    const load = () => fetch(`${API}/rider-hierarchy`)
       .then(r => r.json())
       .then(data => {
         if (data.hierarchy) { setRiders(data.hierarchy); setApiStatus("online"); }
       })
       .catch(() => setApiStatus("offline"));
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
   }, []);
 
   const handleRateSubmit = (result) => {

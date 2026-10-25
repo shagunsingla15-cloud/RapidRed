@@ -11,7 +11,7 @@ import RiderCommandCenter from "./components/RiderCommandCeter";
 import ProofUpload from "./components/ProofUpload";
 
 const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:8000";
-const DEMO_MODE = true;
+const DEMO_MODE = process.env.REACT_APP_DEMO_MODE !== "false";
 
 // ─── MOCK DATA ───────────────────────────────────────────────────────────────
 const MOCK_HOSPITALS = {
@@ -394,43 +394,68 @@ function StyleTag() {
 // ════════════════════════════════════════════════════════════════════════════
 // VIEW 1: DASHBOARD
 // ════════════════════════════════════════════════════════════════════════════
-function Dashboard() {
-  const [hospitals, setHospitals] = useState(MOCK_HOSPITALS);
+function Dashboard({ onRequest }) {
+  const [hospitals, setHospitals] = useState(DEMO_MODE ? MOCK_HOSPITALS : {});
   const [match,     setMatch]     = useState(null);
-  const [form,      setForm]      = useState({ blood_group: "O-", lat: "28.5672", lng: "77.2100", units: "1" });
+  const [form,      setForm]      = useState({ blood_group: "O-", lat: "28.5677", lng: "77.2433", units: "1", donor: "" });
   const [loading,   setLoading]   = useState(false);
   const [trackId,   setTrackId]   = useState("");
   const [trackData, setTrackData] = useState(null);
+  const [error, setError]         = useState("");
+  const [trackErr, setTrackErr]   = useState("");
+
+  // keep the overview in sync with the backend stock
+  const loadHospitals = React.useCallback(() => {
+    if (DEMO_MODE) return;
+    axios.get(`${API_BASE}/hospitals`).then(res => setHospitals(res.data.hospitals)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    loadHospitals();
+    const t = setInterval(loadHospitals, 4000);
+    return () => clearInterval(t);
+  }, [loadHospitals]);
 
   const bloodGroups = Object.entries(
     Object.values(hospitals).reduce((acc, h) => {
       Object.entries(h.inventory).forEach(([g, u]) => { acc[g] = (acc[g] || 0) + u; });
       return acc;
     }, {})
-  ).map(([g, u]) => ({ group: g, units: u }));
+  ).map(([g, u]) => ({ group: g, units: u }))
+   .sort((a, b) => BLOOD_GROUPS.indexOf(a.group) - BLOOD_GROUPS.indexOf(b.group));
 
   const requestBlood = async () => {
     setLoading(true);
     if (DEMO_MODE) { setMatch(MOCK_MATCH); setLoading(false); return; }
+    setError("");
     try {
       const res = await axios.post(`${API_BASE}/request-blood`, {
         blood_group: form.blood_group, recipient_lat: parseFloat(form.lat),
         recipient_lng: parseFloat(form.lng), units_needed: parseInt(form.units),
+        donor_id: form.donor.trim() || null,
       });
       setMatch(res.data);
-    } catch { setMatch(MOCK_MATCH); }
+      loadHospitals();
+      if (onRequest) onRequest(res.data.request_id);
+    } catch (e) {
+      const d = e.response && e.response.data && e.response.data.detail;
+      setMatch(null);
+      setError(typeof d === "string" ? d : "Could not reach the server. Is the backend running?");
+    }
     setLoading(false);
   };
 
   const trackRider = async () => {
     if (!trackId) return;
+    setTrackErr("");
     if (DEMO_MODE) { setTrackData({ request_id: trackId, status:"EN_ROUTE", progress_pct:62, remaining_eta:3.1, rider_name:"Arjun K.", hospital:"AIIMS Delhi", blood_group:"O-" }); return; }
     try {
-      const res = await axios.get(`${API_BASE}/track-rider/${trackId}`);
+      const res = await axios.get(`${API_BASE}/track-rider/${trackId.trim()}`);
       setTrackData(res.data);
-    } catch { setTrackData(null); }
+    } catch (e) {
+      setTrackData(null);
+      setTrackErr(e.response && e.response.status === 404 ? "Request ID not found." : "Could not reach the server.");
+    }
   };
-
   return (
     <div className="slide-in">
       <h2>Live Dispatch</h2>
@@ -461,6 +486,10 @@ function Dashboard() {
               <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>Units Needed</label>
               <input type="number" min="1" value={form.units} onChange={e => setForm(f => ({ ...f, units: e.target.value }))} />
             </div>
+            <div>
+              <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>Donor ID (optional, e.g. D001 earns health credits)</label>
+              <input type="text" placeholder="D001" value={form.donor} onChange={e => setForm(f => ({ ...f, donor: e.target.value }))} />
+            </div>
             <button className="primary" onClick={requestBlood} disabled={loading}>
               {loading ? "Matching…" : "⚡ Find Best Match"}
             </button>
@@ -471,9 +500,15 @@ function Dashboard() {
         <div className={`card ${match ? "sos-active" : ""}`}>
           <h3>📍 Match Result</h3>
           {!match ? (
-            <div style={{ color: "var(--muted)", fontSize: 13, fontFamily: "var(--font-mono)" }}>
-              // Awaiting dispatch request…
-            </div>
+            error ? (
+              <div role="alert" style={{ background: "rgba(192,57,43,.12)", border: "1px solid #c0392b66", borderRadius: 8, padding: 12, fontSize: 13, color: "#e74c3c" }}>
+                {error}
+              </div>
+            ) : (
+              <div style={{ color: "var(--muted)", fontSize: 13, fontFamily: "var(--font-mono)" }}>
+                // Awaiting dispatch request…
+              </div>
+            )
           ) : (
             <div>
               <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
@@ -508,6 +543,9 @@ function Dashboard() {
       {/* Inventory Overview */}
       <div className="card" style={{ marginBottom: 20 }}>
         <h3>🩸 Network Inventory Overview</h3>
+        {bloodGroups.length === 0 && (
+          <div style={{ color: "var(--muted)", fontSize: 12, fontFamily: "var(--font-mono)" }}>Connecting to the backend… (a sleeping server can take up to a minute to wake up)</div>
+        )}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {bloodGroups.map(({ group, units }) => (
             <div key={group} style={{
@@ -530,6 +568,9 @@ function Dashboard() {
             onChange={e => setTrackId(e.target.value)} style={{ flex: 1 }} />
           <button className="primary" onClick={trackRider}>Track</button>
         </div>
+        {trackErr && (
+          <div role="alert" style={{ marginBottom: 12, fontSize: 12, color: "#e74c3c" }}>{trackErr}</div>
+        )}
         {trackData && (
           <div style={{ background: "var(--surface)", borderRadius: 8, padding: 14 }}>
             <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
@@ -691,12 +732,16 @@ function MishapPopup({ onClose, onSelect }) {
     </div>
   );
 }
-
+const fmtIssued = (d) => {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} · ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
 // ── Main TrackingView (Mission Control) ───────────────────────────────────
-function TrackingView() {
+function TrackingView({ autoId }) {
   const [delivery,    setDelivery]    = React.useState(null);
   const [loading,     setLoading]     = React.useState(false);
-  const [trackId,     setTrackId]     = React.useState("DEL-4402");
+  const [loadErr,     setLoadErr]     = React.useState("");
+  const [trackId,     setTrackId]     = React.useState(DEMO_MODE ? "DEL-4402" : "");
   const [progress,    setProgress]    = React.useState(62);
   const [speed,       setSpeed]       = React.useState(34);
   const [eta,         setEta]         = React.useState(3.1);
@@ -707,17 +752,37 @@ function TrackingView() {
   const [msgSent,     setMsgSent]     = React.useState("");
   const [alertLog,    setAlertLog]    = React.useState([]);
   const stationaryRef = React.useRef(null);
+  const deliveredRef = React.useRef(false);
+  const [isLive, setIsLive] = React.useState(false);
 
-  // simulate live progress
+  // progress: poll the real backend for a live request, otherwise simulate
   React.useEffect(() => {
     if (!delivery || mishapReason === "accident") return;
+    if (isLive) {
+      const t = setInterval(async () => {
+        try {
+          const r = await axios.get(`${API_BASE}/track-rider/${delivery.delivery_id}`);
+          setProgress(r.data.progress_pct);
+          setEta(r.data.remaining_eta);
+          setSpeed(Math.floor(28 + Math.random() * 18));
+        } catch (e) { /* keep last values */ }
+      }, 2000);
+      return () => clearInterval(t);
+    }
     const t = setInterval(() => {
       setProgress(p => Math.min(100, p + 0.4));
       setEta(e => Math.max(0, parseFloat((e - 0.05).toFixed(1))));
       setSpeed(Math.floor(28 + Math.random() * 18));
     }, 1200);
     return () => clearInterval(t);
-  }, [delivery, mishapReason]);
+  }, [delivery, mishapReason, isLive]);
+
+  // tell the backend when the delivery reaches 100% (frees the rider, awards credits, updates Notion)
+  React.useEffect(() => {
+    if (DEMO_MODE || !delivery || !isLive || progress < 100 || deliveredRef.current) return;
+    deliveredRef.current = true;
+    axios.post(`${API_BASE}/complete-delivery`, { request_id: delivery.delivery_id }).catch(() => {});
+  }, [progress, delivery, isLive]);
 
   // stationary timer → trigger mishap popup after 8s
   React.useEffect(() => {
@@ -726,15 +791,54 @@ function TrackingView() {
     return () => clearTimeout(stationaryRef.current);
   }, [delivery, showMishap, mishapReason]);
 
-  const loadDelivery = async () => {
+  const loadDelivery = async (idArg) => {
     setLoading(true);
-    await new Promise(r => setTimeout(r, 500));
-    setDelivery(MOCK_DELIVERY);
-    setProgress(62); setEta(3.1); setSpeed(34);
+    setLoadErr("");
+    const id = (typeof idArg === "string" ? idArg : trackId).trim();
+    setTrackId(id);
+    deliveredRef.current = false;
+    let live = null;
+    if (!DEMO_MODE) {
+      if (!id) { setLoadErr("Enter a Request ID, or make a request on the Dashboard first."); setLoading(false); return; }
+      try { live = (await axios.get(`${API_BASE}/track-rider/${id}`)).data; }
+      catch (e) {
+        setLoadErr(e.response && e.response.status === 404
+          ? "Request not found. Make a new request on the Dashboard (the server forgets requests when it restarts)."
+          : "Could not reach the server. Is the backend running?");
+        setDelivery(null); setLoading(false); return;
+      }
+    }
+    if (live) {
+      setDelivery({
+        ...MOCK_DELIVERY,
+        delivery_id:   live.request_id,
+        blood_group:   live.blood_group,
+        blood_label:   live.blood_group,
+        units:         live.units || 1,
+        rider_name:    live.rider_name,
+        rider_id:      live.rider ? live.rider.id : MOCK_DELIVERY.rider_id,
+        tier:          live.rider && live.rider.tier ? live.rider.tier : MOCK_DELIVERY.tier,
+        from_hospital: live.hospital,
+        to_hospital:   "Recipient location",
+        issued_at:     fmtIssued(live.created_at ? new Date(live.created_at * 1000) : new Date()),
+      });
+      setProgress(live.progress_pct); setEta(live.remaining_eta); setIsLive(true);
+    } else {
+      await new Promise(r => setTimeout(r, 500));
+      setDelivery({ ...MOCK_DELIVERY, issued_at: fmtIssued(new Date()) });
+      setProgress(62); setEta(3.1); setIsLive(false);
+    }
+    setSpeed(34);
     setMishapReason(null); setBackupRider(null);
     setAssistSent(false); setAlertLog([]);
     setLoading(false);
   };
+
+  // auto-load the request that was just made on the Dashboard
+  React.useEffect(() => {
+    if (autoId && !DEMO_MODE) { setTrackId(autoId); loadDelivery(autoId); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoId]);
 
   const handleMishap = (reason) => {
     setShowMishap(false);
@@ -764,6 +868,7 @@ function TrackingView() {
   const statusLabel = mishapReason === "accident" ? "⚠ ACCIDENT"
     : mishapReason === "traffic"  ? "🚦 DELAYED"
     : mishapReason === "weather"  ? "🌧 DELAYED"
+    : progress >= 100 ? "✅ DELIVERED"
     : "🟢 EN ROUTE";
 
   return (
@@ -782,6 +887,9 @@ function TrackingView() {
             {loading ? "Loading…" : "⚡ Track"}
           </button>
         </div>
+        {loadErr && (
+          <div role="alert" style={{ marginTop: 10, fontSize: 12, color: "#e74c3c" }}>{loadErr}</div>
+        )}
       </div>
 
       {!delivery ? (
@@ -810,7 +918,20 @@ function TrackingView() {
               <div className="mc-stat-lbl">Issued At</div>
             </div>
           </div>
-
+          {/* ── Delivered banner ── */}
+          {progress >= 100 && (
+            <div style={{ marginBottom:16, padding:"14px 18px", borderRadius:12,
+              background:"rgba(39,174,96,.12)", border:"1px solid #27ae6066" }}>
+              <div style={{ fontWeight:800, fontSize:15, color:"#27ae60" }}>✅ Blood delivered</div>
+              <div style={{ fontSize:13, color:"var(--text)", marginTop:6, lineHeight:1.7 }}>
+                {delivery.blood_group} ({delivery.units} unit{delivery.units > 1 ? "s" : ""}) from <b>{delivery.from_hospital}</b> was
+                delivered to <b>{delivery.to_hospital}</b> by <b>{delivery.rider_name}</b> ({delivery.rider_id}).
+              </div>
+              <div style={{ fontSize:13, color:"#27ae60", marginTop:6 }}>
+                🟢 {delivery.rider_name} is now free and available for the next request.
+              </div>
+            </div>
+          )}
           {/* ── Row 2: Map + Rider Profile ── */}
           <div style={{ display:"grid", gridTemplateColumns:"1fr 320px", gap:16, marginBottom:16 }}>
 
@@ -878,6 +999,7 @@ function TrackingView() {
                   fontFamily:"var(--font-mono)", lineHeight:1.8 }}>
                   📦 {delivery.from_hospital}<br/>
                   🏥 → {delivery.to_hospital}
+                  {progress >= 100 && (<><br/><span style={{ color:"#27ae60" }}>🟢 Available</span></>)}
                 </div>
               </div>
 
@@ -969,7 +1091,7 @@ function TrackingView() {
           )}
         </>
       )}
-      {delivery && <ProofUpload requestId={trackId} />}
+      {delivery && isLive && <ProofUpload requestId={delivery.delivery_id} />}
     </div>
   );
 }
@@ -978,7 +1100,7 @@ function TrackingView() {
 // VIEW 3: DONOR WALLET
 // ════════════════════════════════════════════════════════════════════════════
 function BloodInventoryGraph() {
-  const data = [
+  const SAMPLE_DATA = [
     { group: "O-", units: 8, rarity: "CRITICAL" },
     { group: "O+", units: 70, rarity: "COMMON" },
     { group: "A-", units: 6, rarity: "HIGH" },
@@ -989,6 +1111,19 @@ function BloodInventoryGraph() {
     { group: "AB+", units: 22, rarity: "COMMON" },
     { group: "Bombay", units: 3, rarity: "CRITICAL" },
   ];
+  const [data, setData] = useState(SAMPLE_DATA);
+  useEffect(() => {
+    if (DEMO_MODE) return;
+    const load = () => axios.get(`${API_BASE}/hospitals`).then(res => {
+      const totals = {};
+      Object.values(res.data.hospitals).forEach(h =>
+        Object.entries(h.inventory).forEach(([g, u]) => { totals[g] = (totals[g] || 0) + u; }));
+      setData(BLOOD_GROUPS.map(g => ({ group: g, units: totals[g] || 0, rarity: RARITY[g] || "COMMON" })));
+    }).catch(() => {});
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, []);
 
   const CustomDot = (props) => {
     const { cx, cy, payload } = props;
@@ -1018,13 +1153,16 @@ function BloodInventoryGraph() {
     </div>
   );
 }
-
+const CREDIT_PER_UNIT = { "Bombay": 500, "AB-": 200, "O-": 150, "B-": 120, "A-": 100, "AB+": 60, "B+": 50, "A+": 40, "O+": 30 };
 function DonorWallet() {
   const [donor, setDonor] = useState(MOCK_DONOR);
 
   useEffect(() => {
     if (DEMO_MODE) return;
-    axios.get(`${API_BASE}/donor/D001`).then(r => setDonor(r.data)).catch(() => {});
+    const load = () => axios.get(`${API_BASE}/donor/D001`).then(r => setDonor(r.data)).catch(() => {});
+    load();
+    const t = setInterval(load, 4000);
+    return () => clearInterval(t);
   }, []);
 
   return (
@@ -1076,15 +1214,37 @@ function DonorWallet() {
 // VIEW 4: NETWORK INSIGHTS
 // ════════════════════════════════════════════════════════════════════════════
 function NetworkInsights() {
-  const [hierarchy, setHierarchy] = useState(MOCK_HIERARCHY);
+  const [hierarchy, setHierarchy] = useState(DEMO_MODE ? MOCK_HIERARCHY : []);
   const [selected, setSelected]   = useState(null);
+  const [shareForm, setShareForm] = useState({ from: "H001", to: "H002", group: "O+", units: "1" });
+  const [shareMsg, setShareMsg]   = useState("");
+  const [shareErr, setShareErr]   = useState("");
 
-  useEffect(() => {
+  const loadHierarchy = React.useCallback(() => {
     if (DEMO_MODE) return;
-    axios.get(`${API_BASE}/network-hierarchy`)
-      .then(res => setHierarchy(res.data.hierarchy))
-      .catch(() => setHierarchy(MOCK_HIERARCHY));
+    axios.get(`${API_BASE}/network-hierarchy`).then(res => setHierarchy(res.data.hierarchy)).catch(() => {});
   }, []);
+  useEffect(() => {
+    loadHierarchy();
+    const t = setInterval(loadHierarchy, 4000);
+    return () => clearInterval(t);
+  }, [loadHierarchy]);
+
+  const shareUnits = async () => {
+    setShareMsg(""); setShareErr("");
+    if (DEMO_MODE) { setShareErr("Sharing needs the live backend. Turn off demo mode first."); return; }
+    try {
+      const res = await axios.post(`${API_BASE}/share-units`, {
+        from_hospital_id: shareForm.from, to_hospital_id: shareForm.to,
+        blood_group: shareForm.group, units: parseInt(shareForm.units, 10),
+      });
+      setShareMsg(`✓ ${res.data.units} unit(s) of ${res.data.blood_group} moved from ${res.data.from} to ${res.data.to}`);
+      loadHierarchy();
+    } catch (e) {
+      const d = e.response && e.response.data && e.response.data.detail;
+      setShareErr(typeof d === "string" ? d : "Could not reach the server. Is the backend running?");
+    }
+  };
 
   const allFlows = hierarchy.flatMap(h =>
     (h.shared_history || []).map(s => ({
@@ -1107,7 +1267,43 @@ function NetworkInsights() {
           Share Score = <strong style={{ color: "var(--blue)" }}>(Total_Shared × 0.7) + (Capacity_Ratio × 0.3 × 100)</strong>
         </p>
       </div>
-
+      <div className="card" style={{ marginBottom: 20 }}>
+        <h3>🔁 Share Units Between Hospitals</h3>
+        <p style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)", marginBottom: 12 }}>
+          Moves stock from one hospital to another and raises the sender's share score.
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 10 }}>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>From</label>
+            <select value={shareForm.from} onChange={e => setShareForm(f => ({ ...f, from: e.target.value }))}>
+              {hierarchy.map(h => <option key={h.hospital_id} value={h.hospital_id}>{h.hospital_name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>To</label>
+            <select value={shareForm.to} onChange={e => setShareForm(f => ({ ...f, to: e.target.value }))}>
+              {hierarchy.map(h => <option key={h.hospital_id} value={h.hospital_id}>{h.hospital_name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>Blood group</label>
+            <select value={shareForm.group} onChange={e => setShareForm(f => ({ ...f, group: e.target.value }))}>
+              {BLOOD_GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>Units</label>
+            <input type="number" min="1" value={shareForm.units} onChange={e => setShareForm(f => ({ ...f, units: e.target.value }))} />
+          </div>
+        </div>
+        <button className="primary" onClick={shareUnits}>Share Units</button>
+        {shareMsg && (
+          <div style={{ marginTop: 10, background: "rgba(39,174,96,.1)", border: "1px solid #27ae6044", borderRadius: 8, padding: 10, fontFamily: "var(--font-mono)", fontSize: 12, color: "#27ae60" }}>{shareMsg}</div>
+        )}
+        {shareErr && (
+          <div role="alert" style={{ marginTop: 10, background: "rgba(192,57,43,.12)", border: "1px solid #c0392b66", borderRadius: 8, padding: 10, fontSize: 12, color: "#e74c3c" }}>{shareErr}</div>
+        )}
+      </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
         {hierarchy.map(h => (
           <div key={h.hospital_id} className="card"
@@ -1165,9 +1361,53 @@ function NetworkInsights() {
 // VIEW 5: INVENTORY CONTROL
 // ════════════════════════════════════════════════════════════════════════════
 function InventoryControl() {
-  const [hospitals, setHospitals] = useState(MOCK_HOSPITALS);
+  const [hospitals, setHospitals] = useState(DEMO_MODE ? MOCK_HOSPITALS : {});
   const [form, setForm]           = useState({ hospital_id: "H001", blood_group: "O-", delta: "1" });
   const [result, setResult]       = useState(null);
+  const [camps, setCamps]         = useState([]);
+  const [campForm, setCampForm]   = useState({ hospital_id: "H001", name: "", units: {} });
+  const [campMsg, setCampMsg]     = useState("");
+  const [campErr, setCampErr]     = useState("");
+
+  // keep stock in sync with the backend (dispatches, deliveries, camps)
+  const loadHospitals = React.useCallback(() => {
+    if (DEMO_MODE) return;
+    axios.get(`${API_BASE}/hospitals`).then(res => setHospitals(res.data.hospitals)).catch(() => {});
+    axios.get(`${API_BASE}/camps`).then(res => setCamps(res.data.camps)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    loadHospitals();
+    const t = setInterval(loadHospitals, 4000);
+    return () => clearInterval(t);
+  }, [loadHospitals]);
+
+  const recordCamp = async () => {
+    setCampMsg(""); setCampErr("");
+    const units = {};
+    Object.entries(campForm.units).forEach(([g, v]) => { const n = parseInt(v, 10); if (n > 0) units[g] = n; });
+    if (!Object.keys(units).length) { setCampErr("Enter the units collected for at least one blood group."); return; }
+    const total = Object.values(units).reduce((a, b) => a + b, 0);
+    if (DEMO_MODE) {
+      const h = { ...hospitals };
+      const hh = { ...h[campForm.hospital_id], inventory: { ...h[campForm.hospital_id].inventory } };
+      Object.entries(units).forEach(([g, n]) => { hh.inventory[g] = (hh.inventory[g] || 0) + n; });
+      h[campForm.hospital_id] = hh;
+      setHospitals(h);
+      setCamps(c => [{ camp_id: "LOCAL", hospital_name: hh.name, camp_name: campForm.name || "Blood donation camp", units, total_units: total, timestamp: "just now" }, ...c]);
+      setCampMsg(`✓ Camp recorded: +${total} units added to ${hh.name}`);
+      return;
+    }
+    try {
+      const res = await axios.post(`${API_BASE}/record-camp`, { hospital_id: campForm.hospital_id, camp_name: campForm.name || null, units });
+      setCamps(c => [res.data.camp, ...c]);
+      setCampMsg(`✓ Camp recorded: +${res.data.camp.total_units} units added to ${res.data.camp.hospital_name}`);
+      setCampForm(f => ({ ...f, units: {} }));
+      loadHospitals();
+    } catch (e) {
+      const d = e.response && e.response.data && e.response.data.detail;
+      setCampErr(typeof d === "string" ? d : "Could not reach the server. Is the backend running?");
+    }
+  };
 
   const updateStock = async () => {
     if (DEMO_MODE) {
@@ -1182,12 +1422,16 @@ function InventoryControl() {
     try {
       const res = await axios.post(`${API_BASE}/update-stock`, { hospital_id: form.hospital_id, blood_group: form.blood_group, delta: parseInt(form.delta) });
       setResult(res.data);
+      loadHospitals();
     } catch {}
   };
 
   return (
     <div className="slide-in">
       <h2>Inventory Control</h2>
+      {Object.keys(hospitals).length === 0 && (
+        <p style={{ color: "var(--muted)", fontSize: 12, fontFamily: "var(--font-mono)" }}>Connecting to the backend… (a sleeping server can take up to a minute to wake up)</p>
+      )}
       <p className="subtitle">// Stock Management · Real-Time Updates · Critical Alerts</p>
 
       <div className="grid-2" style={{ marginBottom: 20 }}>
@@ -1234,7 +1478,57 @@ function InventoryControl() {
           )}
         </div>
       </div>
-
+      {/* ── Blood donation camp ── */}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <h3>🏕 Blood Donation Camp</h3>
+        <p style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)", marginBottom: 12 }}>
+          Record the units collected at a camp. Stock increases automatically.
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginBottom: 14 }}>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>Hospital organising the camp</label>
+            <select value={campForm.hospital_id} onChange={e => setCampForm(f => ({ ...f, hospital_id: e.target.value }))}>
+              {Object.entries(hospitals).map(([id, h]) => <option key={id} value={id}>{h.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--muted)", display: "block", marginBottom: 4 }}>Camp name (optional)</label>
+            <input type="text" placeholder="e.g. Independence Day Camp" value={campForm.name}
+              onChange={e => setCampForm(f => ({ ...f, name: e.target.value }))} />
+          </div>
+        </div>
+        <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>Units collected (fill only the blood groups collected)</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(84px, 1fr))", gap: 8, marginBottom: 14 }}>
+          {BLOOD_GROUPS.map(g => (
+            <div key={g} style={{ background: "var(--surface)", border: `1px solid ${rarityColor(g)}44`, borderRadius: 8, padding: "8px 10px", textAlign: "center" }}>
+              <div style={{ fontFamily: "var(--font-mono)", fontWeight: 700, color: rarityColor(g), fontSize: 13, marginBottom: 4 }}>{g}</div>
+              <input type="number" min="0" placeholder="0" value={campForm.units[g] || ""}
+                onChange={e => setCampForm(f => ({ ...f, units: { ...f.units, [g]: e.target.value } }))}
+                style={{ textAlign: "center" }} />
+            </div>
+          ))}
+        </div>
+        <button className="primary" onClick={recordCamp}>Record Camp ({Object.values(campForm.units).reduce((a, v) => a + (parseInt(v, 10) || 0), 0)} units)</button>
+        {campMsg && (
+          <div style={{ marginTop: 10, background: "rgba(39,174,96,.1)", border: "1px solid #27ae6044", borderRadius: 8, padding: 10, fontFamily: "var(--font-mono)", fontSize: 12, color: "#27ae60" }}>{campMsg}</div>
+        )}
+        {campErr && (
+          <div role="alert" style={{ marginTop: 10, background: "rgba(192,57,43,.12)", border: "1px solid #c0392b66", borderRadius: 8, padding: 10, fontSize: 12, color: "#e74c3c" }}>{campErr}</div>
+        )}
+        {camps.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 11, color: "var(--muted)", fontWeight: 700, marginBottom: 6 }}>RECENT CAMPS</div>
+            {camps.slice(0, 5).map((c, i) => (
+              <div key={c.camp_id + i} style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", padding: "7px 0", borderBottom: "1px solid var(--border)", fontSize: 12 }}>
+                <span><b>{c.camp_name}</b> · {c.hospital_name}</span>
+                <span style={{ fontFamily: "var(--font-mono)", color: "#27ae60" }}>
+                  +{c.total_units} units ({Object.entries(c.units).map(([g, n]) => `${g}: ${n}`).join(", ")}) · {c.timestamp}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
       {Object.entries(hospitals).map(([id, h]) => (
         <div key={id} className="card" style={{ marginBottom: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
@@ -2758,6 +3052,7 @@ function CodeRare() {
 // ════════════════════════════════════════════════════════════════════════════
 export default function App() {
   const [tab, setTab] = useState("dashboard");
+  const [lastReqId, setLastReqId] = useState("");
 
   const tabs = [
     { id: "dashboard", label: "🏥 Dashboard" },
@@ -2787,8 +3082,8 @@ export default function App() {
         </div>
       </nav>
       <main>
-        {tab === "dashboard" && <Dashboard />}
-        {tab === "tracking"  && <TrackingView />}
+        {tab === "dashboard" && <Dashboard onRequest={setLastReqId} />}
+        {tab === "tracking"  && <TrackingView autoId={lastReqId} />}
         {tab === "wallet"    && <DonorWallet />}
         {tab === "network"   && <NetworkInsights />}
         {tab === "inventory" && <InventoryControl />}

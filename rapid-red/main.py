@@ -1,15 +1,18 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List
-import math, time, uuid, random
+import math, time, uuid, random, threading, os
+import notion_log
+
+# One lock protects stock, riders and requests (FastAPI runs endpoints in parallel threads)
+STATE_LOCK = threading.RLock()
 
 app = FastAPI(title="RapidRed API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",")],    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -169,7 +172,7 @@ def pick_best_rider(hospital_lat: float, hospital_lng: float, blood_group: str =
         ranked = [r for r in ranked if r["tier"] in ("Platinum", "Gold")]
     available = [r for r in ranked if r["status"] == "Available"]
     if not available:
-        available = ranked
+        return None
     best_priority = available[0]["tier_priority"]
     top_tier      = [r for r in available if r["tier_priority"] == best_priority]
     return min(top_tier, key=lambda r: haversine(hospital_lat, hospital_lng, r["lat"], r["lng"]))
@@ -296,42 +299,96 @@ def share_units(req: ShareUnits):
         raise HTTPException(status_code=404, detail="Source hospital not found.")
     if req.to_hospital_id not in HOSPITALS:
         raise HTTPException(status_code=404, detail="Destination hospital not found.")
-    src = HOSPITALS[req.from_hospital_id]
-    dst = HOSPITALS[req.to_hospital_id]
-    if src["inventory"].get(req.blood_group, 0) < req.units:
-        raise HTTPException(status_code=400, detail="Insufficient stock to share.")
-    src["inventory"][req.blood_group] -= req.units
-    dst["inventory"][req.blood_group]  = dst["inventory"].get(req.blood_group, 0) + req.units
-    src["total_shared"]   = src.get("total_shared", 0) + req.units
-    dst["total_received"] = dst.get("total_received", 0) + req.units
-    src.setdefault("shared_history", []).append({
-        "to": req.to_hospital_id, "units": req.units,
-        "blood_group": req.blood_group, "timestamp": time.strftime("%Y-%m-%d"),
-    })
+    if req.from_hospital_id == req.to_hospital_id:
+        raise HTTPException(status_code=400, detail="Choose two different hospitals.")
+    if req.blood_group not in RARITY_WEIGHTS:
+        raise HTTPException(status_code=400, detail=f"Unknown blood group: {req.blood_group}")
+    if req.units < 1:
+        raise HTTPException(status_code=400, detail="Units must be at least 1.")
+    with STATE_LOCK:
+        src = HOSPITALS[req.from_hospital_id]
+        dst = HOSPITALS[req.to_hospital_id]
+        if src["inventory"].get(req.blood_group, 0) < req.units:
+            raise HTTPException(status_code=400, detail="Insufficient stock to share.")
+        src["inventory"][req.blood_group] -= req.units
+        dst["inventory"][req.blood_group]  = dst["inventory"].get(req.blood_group, 0) + req.units
+        src["total_shared"]   = src.get("total_shared", 0) + req.units
+        dst["total_received"] = dst.get("total_received", 0) + req.units
+        src.setdefault("shared_history", []).append({
+            "to": req.to_hospital_id, "units": req.units,
+            "blood_group": req.blood_group, "timestamp": time.strftime("%Y-%m-%d"),
+        })
     return {"success": True, "from": src["name"], "to": dst["name"], "units": req.units, "blood_group": req.blood_group}
+def _finalize_delivery(req_id: str, donor_id: Optional[str] = None):
+    """Mark a request delivered exactly once.
+    Returns the result dict, or None if it was already delivered. Raises KeyError if unknown."""
+    with STATE_LOCK:
+        r = ACTIVE_REQUESTS[req_id]
+        if r["status"] == "DELIVERED":
+            return None
+        credits  = HEALTH_CREDIT_VALUES.get(r["blood_group"], 30) * r["units"]
+        donor_id = donor_id or r.get("donor_id")
+        HOSPITALS[r["hospital_id"]]["health_credits"] += credits
+        donor_credits = None
+        if donor_id and donor_id in DONORS:
+            DONORS[donor_id]["health_credits"] += credits
+            DONORS[donor_id]["donations"]      += 1
+            donor_credits = DONORS[donor_id]["health_credits"]
+        rider_id = r["rider"]["id"]
+        if rider_id in RIDERS:
+            RIDERS[rider_id]["status"]            = "Available"
+            RIDERS[rider_id]["total_deliveries"] += 1
+        r["status"] = "DELIVERED"
+        return {"request_id": req_id, "credits_awarded": credits, "donor_credits": donor_credits}
+
+def _auto_deliver(req_id: str):
+    """Runs when the ETA has passed, so the system stays correct even if nobody is watching."""
+    try:
+        result = _finalize_delivery(req_id)
+    except KeyError:
+        return
+    if result is not None:
+        notion_log.mark_delivered(req_id)
+
+def _schedule_auto_delivery(req_id: str, eta_minutes: float):
+    t = threading.Timer(max(eta_minutes, 1) * 60 + 2, _auto_deliver, args=[req_id])
+    t.daemon = True
+    t.start()
 
 @app.post("/request-blood")
-def request_blood(req: BloodRequest):
-    try:
-        ranked = match_hospital(req.blood_group, req.recipient_lat, req.recipient_lng, req.units_needed)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if not ranked:
-        raise HTTPException(status_code=404, detail=f"No hospital has {req.units_needed} unit(s) of {req.blood_group}.")
-    best   = ranked[0]
-    req_id = str(uuid.uuid4())[:8].upper()
-    best_rider = pick_best_rider(HOSPITALS[best["hospital_id"]]["lat"], HOSPITALS[best["hospital_id"]]["lng"], req.blood_group)
-    rider_ref  = {"id": best_rider["rider_id"], "name": best_rider["name"], "tier": best_rider["tier"]}
-    if best_rider["status"] == "Available":
+def request_blood(req: BloodRequest, background_tasks: BackgroundTasks):
+    with STATE_LOCK:
+        try:
+            ranked = match_hospital(req.blood_group, req.recipient_lat, req.recipient_lng, req.units_needed)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if not ranked:
+            raise HTTPException(status_code=404, detail=f"No hospital has {req.units_needed} unit(s) of {req.blood_group}.")
+        best = ranked[0]
+        hosp = HOSPITALS[best["hospital_id"]]
+        best_rider = pick_best_rider(hosp["lat"], hosp["lng"], req.blood_group)
+        if best_rider is None:
+            raise HTTPException(status_code=503, detail="No rider is free right now. Please try again in a minute.")
+        # total ETA = rider travels to the hospital, then to the recipient
+        pickup_km = haversine(best_rider["lat"], best_rider["lng"], hosp["lat"], hosp["lng"])
+        best["eta_minutes"]        = round(best["eta_minutes"] + (pickup_km / RIDER_SPEED_KMH) * 60, 1)
+        best["within_golden_hour"] = best["eta_minutes"] <= GOLDEN_HOUR_MINUTES
+        req_id    = str(uuid.uuid4())[:8].upper()
+        rider_ref = {"id": best_rider["rider_id"], "name": best_rider["name"], "tier": best_rider["tier"]}
         RIDERS[best_rider["rider_id"]]["status"] = "Busy"
-    ACTIVE_REQUESTS[req_id] = {
-        "blood_group": req.blood_group, "units": req.units_needed,
-        "hospital_id": best["hospital_id"], "hospital_name": best["hospital_name"],
-        "distance_km": best["distance_km"], "eta_minutes": best["eta_minutes"],
-        "status": "DISPATCHED", "created_at": time.time(),
-        "donor_id": req.donor_id, "rider": rider_ref,
-    }
-    HOSPITALS[best["hospital_id"]]["inventory"][req.blood_group] -= req.units_needed
+        ACTIVE_REQUESTS[req_id] = {
+            "blood_group": req.blood_group, "units": req.units_needed,
+            "hospital_id": best["hospital_id"], "hospital_name": best["hospital_name"],
+            "distance_km": best["distance_km"], "eta_minutes": best["eta_minutes"],
+            "status": "DISPATCHED", "created_at": time.time(),
+            "donor_id": req.donor_id, "rider": rider_ref,
+        }
+        hosp["inventory"][req.blood_group] -= req.units_needed
+    background_tasks.add_task(
+        notion_log.log_request, req_id, req.blood_group, req.units_needed,
+        best["hospital_name"], best_rider["name"], best["eta_minutes"],
+    )
+    _schedule_auto_delivery(req_id, best["eta_minutes"])
     return {
         "request_id": req_id, "blood_group": req.blood_group, "units_needed": req.units_needed,
         "best_match": best, "all_candidates": ranked, "rider": rider_ref,
@@ -341,42 +398,32 @@ def request_blood(req: BloodRequest):
 
 @app.get("/track-rider/{req_id}")
 def track_rider(req_id: str):
-    req_id = req_id.upper()
+    req_id = req_id.strip().upper()
     if req_id not in ACTIVE_REQUESTS:
         raise HTTPException(status_code=404, detail="Request ID not found.")
     r        = ACTIVE_REQUESTS[req_id]
     elapsed  = (time.time() - r["created_at"]) / 60
-    progress = min(elapsed / max(r["eta_minutes"], 1), 1.0)
+    progress = 1.0 if r["status"] == "DELIVERED" else min(elapsed / max(r["eta_minutes"], 1), 1.0)
     status   = "DELIVERED" if progress >= 1.0 else "EN_ROUTE" if progress > 0.5 else "DISPATCHED"
     return {
         "request_id": req_id, "status": status,
         "progress_pct": round(progress * 100, 1),
-        "remaining_eta": max(0, round(r["eta_minutes"] - elapsed, 1)),
+        "remaining_eta": 0 if progress >= 1.0 else max(0, round(r["eta_minutes"] - elapsed, 1)),
         "rider": r["rider"], "rider_name": r["rider"]["name"],
         "hospital": r["hospital_name"], "blood_group": r["blood_group"],
+        "units": r["units"], "created_at": r["created_at"],
     }
 
 @app.post("/complete-delivery")
-def complete_delivery(req: CompleteDelivery):
-    req_id = req.request_id.upper()
+def complete_delivery(req: CompleteDelivery, background_tasks: BackgroundTasks):
+    req_id = req.request_id.strip().upper()
     if req_id not in ACTIVE_REQUESTS:
         raise HTTPException(status_code=404, detail="Request not found.")
-    r           = ACTIVE_REQUESTS[req_id]
-    blood_group = r["blood_group"]
-    credits     = HEALTH_CREDIT_VALUES.get(blood_group, 30) * r["units"]
-    donor_id    = req.donor_id or r.get("donor_id")
-    HOSPITALS[r["hospital_id"]]["health_credits"] += credits
-    donor_credits = None
-    if donor_id and donor_id in DONORS:
-        DONORS[donor_id]["health_credits"] += credits
-        DONORS[donor_id]["donations"]      += 1
-        donor_credits = DONORS[donor_id]["health_credits"]
-    rider_id = r["rider"]["id"]
-    if rider_id in RIDERS:
-        RIDERS[rider_id]["status"]            = "Available"
-        RIDERS[rider_id]["total_deliveries"] += 1
-    ACTIVE_REQUESTS[req_id]["status"] = "DELIVERED"
-    return {"request_id": req_id, "credits_awarded": credits, "donor_credits": donor_credits}
+    result = _finalize_delivery(req_id, req.donor_id)
+    if result is None:
+        return {"request_id": req_id, "credits_awarded": 0, "donor_credits": None, "already_delivered": True}
+    background_tasks.add_task(notion_log.mark_delivered, req_id)
+    return result
 
 @app.get("/donor/{donor_id}")
 def get_donor(donor_id: str):
@@ -388,13 +435,56 @@ def get_donor(donor_id: str):
 def update_stock(update: StockUpdate):
     if update.hospital_id not in HOSPITALS:
         raise HTTPException(status_code=404, detail="Hospital not found.")
-    h         = HOSPITALS[update.hospital_id]
-    current   = h["inventory"].get(update.blood_group, 0)
-    new_stock = current + update.delta
-    if new_stock < 0:
-        raise HTTPException(status_code=400, detail=f"Insufficient stock. Available: {current}")
-    h["inventory"][update.blood_group] = new_stock
+    if update.blood_group not in RARITY_WEIGHTS:
+        raise HTTPException(status_code=400, detail=f"Unknown blood group: {update.blood_group}")
+    with STATE_LOCK:
+        h         = HOSPITALS[update.hospital_id]
+        current   = h["inventory"].get(update.blood_group, 0)
+        new_stock = current + update.delta
+        if new_stock < 0:
+            raise HTTPException(status_code=400, detail=f"Insufficient stock. Available: {current}")
+        h["inventory"][update.blood_group] = new_stock
     return {"hospital_id": update.hospital_id, "blood_group": update.blood_group, "new_stock": new_stock}
+
+# ─── BLOOD DONATION CAMPS ────────────────────────────────────────────────────
+class CampRecord(BaseModel):
+    hospital_id: str
+    camp_name: Optional[str] = None
+    units: Dict[str, int]
+
+CAMPS: List[dict] = []
+
+@app.post("/record-camp")
+def record_camp(camp: CampRecord):
+    if camp.hospital_id not in HOSPITALS:
+        raise HTTPException(status_code=404, detail="Hospital not found.")
+    clean = {}
+    for group, n in camp.units.items():
+        if group not in RARITY_WEIGHTS:
+            raise HTTPException(status_code=400, detail=f"Unknown blood group: {group}")
+        if n < 1 or n > 500:
+            raise HTTPException(status_code=400, detail="Units per group must be between 1 and 500.")
+        clean[group] = n
+    if not clean:
+        raise HTTPException(status_code=400, detail="No units given.")
+    with STATE_LOCK:
+        h = HOSPITALS[camp.hospital_id]
+        for group, n in clean.items():
+            h["inventory"][group] = h["inventory"].get(group, 0) + n
+        entry = {
+            "camp_id": uuid.uuid4().hex[:8].upper(),
+            "hospital_id": camp.hospital_id, "hospital_name": h["name"],
+            "camp_name": camp.camp_name or "Blood donation camp",
+            "units": clean, "total_units": sum(clean.values()),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M"),
+        }
+        CAMPS.insert(0, entry)
+        new_stock = {g: h["inventory"][g] for g in clean}
+    return {"camp": entry, "new_stock": new_stock}
+
+@app.get("/camps")
+def list_camps():
+    return {"camps": CAMPS[:20]}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS — NEW: ELITE DISPATCHER & RIDER HIERARCHY
